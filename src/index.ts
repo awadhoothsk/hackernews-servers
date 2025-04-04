@@ -31,7 +31,6 @@ app.notFound((c) => {
     404
   );
 });
-
 // Start the server
 const port = env.PORT ? parseInt(env.PORT.toString(), 10) : 3000;
 
