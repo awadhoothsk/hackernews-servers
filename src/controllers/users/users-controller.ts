@@ -199,3 +199,4 @@ export const GetUserById = async (userId: string): Promise<UserDetails> => {
     throw new Error("Unknown error");
   }
 };
+
