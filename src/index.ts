@@ -1,55 +1,161 @@
-// src/index.ts
-import { Hono } from "hono";
-import { serve } from "@hono/node-server";
-import { allRoutes } from "./routes/routes.js";
-import { prismaClient } from "./extras/prisma.js";
-import { env } from "../environment.js";
+import { createHash, randomUUID } from "crypto";
+import {
+  LogInWithUsernameAndPasswordError,
+  SignUpWithUsernameAndPasswordError,
+  type LogInWithUsernameAndPasswordResult,
+  type SignUpWithUsernameAndPasswordResult,
+} from "./authentication-types.js";
+import { prismaClient as prisma } from "../../integrations/prisma/index.js";
 
-const app = new Hono();
+export const createPasswordHash = (parameters: {
+  password: string;
+}): string => {
+  return createHash("sha256").update(parameters.password).digest("hex");
+};
 
-// Mount all routes
-app.route("/", allRoutes);
+const generateSessionToken = (): string => {
+  return createHash("sha256").update(Math.random().toString()).digest("hex");
+};
 
-// Error handling middleware
-app.onError((err, c) => {
-  console.error(`${err}`);
-  return c.json(
-    {
-      message: "Internal Server Error",
-      error: env.NODE_ENV === "development" ? err.message : undefined,
+export const signUpWithUsernameAndPassword = async (parameters: {
+  username: string;
+  password: string;
+  name: string;
+  email: string;
+}): Promise<SignUpWithUsernameAndPasswordResult> => {
+  try {
+    const existingUser = await prisma.user.findUnique({
+      where: {
+        username: parameters.username,
+      },
+    });
+
+    if (existingUser) {
+      throw SignUpWithUsernameAndPasswordError.CONFLICTING_USERNAME;
+    }
+
+    const hashedPassword = createPasswordHash({
+      password: parameters.password,
+    });
+
+    const sessionToken = generateSessionToken();
+    const now = new Date();
+    const expiresAt = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000); // 30 days
+
+    // Create user with account and session in a transaction
+    const result = await prisma.$transaction(async (tx) => {
+      // Create the user first
+      const newUser = await tx.user.create({
+        data: {
+          username: parameters.username,
+          name: parameters.name,
+          email: parameters.email,
+          emailVerified: false,
+          displayUsername: parameters.username,
+          about: null,
+          image: null,
+        },
+      });
+
+      // Create the account
+      await tx.account.create({
+        data: {
+          id: randomUUID(),
+          accountId: randomUUID(),
+          providerId: "credentials",
+          password: hashedPassword,
+          createdAt: now,
+          updatedAt: now,
+          userId: newUser.id,
+        },
+      });
+
+      // Create the session
+      await tx.session.create({
+        data: {
+          id: randomUUID(),
+          token: sessionToken,
+          expiresAt,
+          createdAt: now,
+          updatedAt: now,
+          userId: newUser.id,
+        },
+      });
+
+      // Get the complete user with all relations
+      const user = await tx.user.findUnique({
+        where: {
+          id: newUser.id,
+        },
+        include: {
+          accounts: true,
+          sessions: true,
+        },
+      });
+
+      if (!user) {
+        throw new Error("Failed to create user");
+      }
+
+      return {
+        token: sessionToken,
+        user,
+      };
+    });
+
+    return result;
+  } catch (e) {
+    console.error(e);
+    throw SignUpWithUsernameAndPasswordError.UNKNOWN;
+  }
+};
+
+export const logInWithUsernameAndPassword = async (parameters: {
+  username: string;
+  password: string;
+}): Promise<LogInWithUsernameAndPasswordResult> => {
+  const passwordHash = createPasswordHash({
+    password: parameters.password,
+  });
+
+  // Find user with account in a single query
+  const user = await prisma.user.findFirst({
+    where: {
+      username: parameters.username,
+      accounts: {
+        some: {
+          providerId: "credentials",
+          password: passwordHash,
+        },
+      },
     },
-    500
-  );
-});
-
-// Not found handler
-app.notFound((c) => {
-  return c.json(
-    {
-      message: "Not Found",
+    include: {
+      accounts: true,
     },
-    404
-  );
-});
-// Start the server
-const port = env.PORT ? parseInt(env.PORT.toString(), 10) : 3000;
+  });
 
-console.log(`Server is running on port ${port}`);
+  if (!user) {
+    throw LogInWithUsernameAndPasswordError.INCORRECT_USERNAME_OR_PASSWORD;
+  }
 
-serve({
-  fetch: app.fetch,
-  port,
-});
+  const sessionToken = generateSessionToken();
+  const now = new Date();
+  const expiresAt = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000); // 30 days
 
-// Graceful shutdown
-process.on("SIGTERM", async () => {
-  console.log("SIGTERM signal received: closing server");
-  await prismaClient.$disconnect();
-  process.exit(0);
-});
+  // Create a new session
+  await prisma.session.create({
+    data: {
+      id: randomUUID(),
+      token: sessionToken,
+      expiresAt,
+      createdAt: now,
+      updatedAt: now,
+      userId: user.id,
+    },
+  });
 
-process.on("SIGINT", async () => {
-  console.log("SIGINT signal received: closing server");
-  await prismaClient.$disconnect();
-  process.exit(0);
-});
+  return {
+    token: sessionToken,
+    user,
+  };
+};
