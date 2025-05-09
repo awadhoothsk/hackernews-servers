@@ -1,5 +1,5 @@
 import { Hono } from "hono";
-import { sessionMiddleware } from "./middlewares/session-middleware.js";
+import { sessionMiddleware } from "./middelwares/session-middleware";
 import {
   GetCommentsError,
   CreateCommentError,
